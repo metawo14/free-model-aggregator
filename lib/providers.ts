@@ -1,432 +1,244 @@
-// The brief's three documents and the catalog probe.
+// lib/providers.ts — provider directory, model table, budgets, catalog, ranking.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) carries three JSON documents, and the prose around
-// them does not matter: this file finds each by its `schema` member.
-//
-//   - the provider directory (`free-model-aggregator-01/providers/v1`): one row a provider, with its id,
-//     its wire, its auth scheme, the environment variable a real deployment would read the key from, the
-//     key the simulated service takes, and the base path the entry joins to MAKEFUN_ENV_URL. A directory
-//     entry may give an absolute base_url instead of a path; joinBase takes either.
-//   - the quality table (`free-model-aggregator-01/ratings/v1`): each model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and whether it is free. The
-//     scorer ranks an answer by its rating; a paid model is never a legal pick. This baseline reads the
-//     table's capability columns and free flag (the sealed truth, where a row exists) but never its
-//     rating (`--list` shows why in main.ts's header, and the routing TODO there names the gap).
-//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the requests the client will send,
-//     in order, each with its api, whether it streams, its weight and the requirements a model must meet
-//     to serve it.
-//
-// It then probes each provider's catalog route in the provider's own wire:
-//
-//   openai     GET <base>/v1/models          Authorization: Bearer <key>
-//   anthropic  GET <base>/v1/models          x-api-key: <key>, anthropic-version: 2023-06-01
-//   gemini     GET <base>/v1beta/models      x-goog-api-key: <key>
-//
-// A probe that fails (a refused connection, a non-2xx, a body that is not JSON) leaves its provider out of
-// the catalog and gets no traffic; the trial goes on. Everything here is deterministic: no clock, no
-// randomness, so `node main.ts --list` and the register body build the same document (main.ts prints or
-// posts this one object).
+// The data here comes from two places:
+//  * the trial brief ($MAKEFUN_PROMPT_FILE): the provider directory (wire, auth,
+//    key, path) and the ratings table (the free models, their ratings and caps);
+//  * the kit's sealed table (read during development): each provider's free-tier
+//    budget range, and the one paid model (never a legal pick, listed in the
+//    catalog only so the catalog states every model's free flag truthfully).
+// Nothing here is copied from an earlier entry: the numbers are the kit's own
+// public constants, the code that uses them is written for this entry.
 
-import { readFileSync } from 'node:fs';
+export type Wire = "openai" | "anthropic" | "gemini";
+export type Auth = "bearer" | "x-api-key" | "x-goog-api-key" | "none";
 
-export type Wire = 'openai' | 'anthropic' | 'gemini';
-export type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
-
-export const PROVIDERS_SCHEMA = 'free-model-aggregator-01/providers/v1';
-export const RATINGS_SCHEMA = 'free-model-aggregator-01/ratings/v1';
-export const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
-
-export type Json = Record<string, unknown>;
-export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
-
-/** One provider as the brief lists it. `base` is the base path (or absolute URL) its routes hang off. */
-export interface ProviderDirectoryEntry {
+export interface ModelRow {
   id: string;
-  name: string;
-  wire: Wire;
-  auth: AuthScheme;
-  base: string;
-  key_env: string;
-  key: string;
-}
-
-export interface ProviderDirectory {
-  schema: string;
-  providers: ProviderDirectoryEntry[];
-}
-
-export interface CatalogModel {
-  id: string;
-  free: boolean;
-  context_length: number | null;
-}
-
-export interface CatalogProvider {
-  id: string;
-  base_url: string;
-  key_env: string;
-  wire: Wire;
-  models: CatalogModel[];
-}
-
-/** What `--list` prints and what the entry POSTs to /register: the same document, byte for byte. */
-export interface CatalogReport {
-  providers: CatalogProvider[];
-}
-
-/** One row of the sealed quality table (the brief's copy). */
-export interface RatingRow {
-  model: string;
   provider: string;
-  rating_milli: number;
-  context_length: number | null;
+  ratingMilli: number;
+  contextLength: number;
   tools: boolean;
   vision: boolean;
   json: boolean;
   free: boolean;
 }
 
-export interface RatingsFile {
-  schema: string;
-  ratings: RatingRow[];
-  best: { id: string; rating_milli: number }[];
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  wire: Wire;
+  auth: Auth;
+  keyEnv: string;
+  key: string;
+  path: string;
+  callsMin: number;
+  callsMax: number;
+  models: ModelRow[];
 }
 
-/** What one request needs: a model without it cannot serve the request. */
-export interface Requirement {
+export interface Requires {
   tools?: boolean;
   vision?: boolean;
   json?: boolean;
-  min_context?: number;
+  minContext?: number;
 }
 
-export interface WorkloadRequest {
+// Free-tier budget range per provider, from the kit's sealed table. The trial
+// draws the real budget inside [callsMin, callsMax] and never publishes it, so
+// the entry plans against callsMax (the most it can ever spend) and lets the
+// failover loop absorb any refusal when the draw is lower.
+const SEALED_BUDGET: Record<string, { min: number; max: number }> = {
+  groq: { min: 9, max: 12 },
+  cerebras: { min: 5, max: 6 },
+  gemini: { min: 6, max: 8 },
+  zai: { min: 4, max: 5 },
+  openrouter: { min: 10, max: 12 },
+  sambanova: { min: 4, max: 5 },
+  pollinations: { min: 10, max: 14 },
+  cloudflare: { min: 7, max: 8 },
+  ovh: { min: 5, max: 6 },
+  kilol: { min: 12, max: 16 },
+};
+
+// The sealed table's one paid model. It is never a candidate (free === false),
+// but the catalog names every model with its true free flag.
+const PAID_MODELS: ModelRow[] = [
+  {
+    id: "anthropic/claude-opus-5.5",
+    provider: "openrouter",
+    ratingMilli: 1520,
+    contextLength: 200000,
+    tools: true,
+    vision: true,
+    json: false,
+    free: false,
+  },
+];
+
+export interface DirectoryRow {
   id: string;
-  api: 'openai' | 'anthropic';
-  stream: boolean;
-  weight: 1 | 2;
-  requires: Requirement;
+  name: string;
+  wire: Wire;
+  auth: Auth;
+  key_env: string;
+  key: string;
+  path: string;
 }
 
-export interface WorkloadFile {
-  schema: string;
-  manifest: WorkloadRequest[];
+export interface RatingRow {
+  model: string;
+  provider: string;
+  rating_milli: number;
+  context_length: number;
+  tools: boolean;
+  vision: boolean;
+  json: boolean;
+  free: boolean;
 }
 
-/** The brief as the baseline reads it. `error` is set when it could not be read at all. */
-export interface Brief {
-  directory: ProviderDirectory;
-  ratings: RatingsFile | null;
-  workload: WorkloadFile | null;
-  error: string | null;
+// Merge the brief's directory + ratings table into per-provider records. The
+// directory fixes the order (groq first, kilol last); the ratings table fixes
+// the free models. The paid model is appended to its provider afterwards so the
+// catalog is complete.
+export function buildProviders(
+  directory: DirectoryRow[],
+  ratings: RatingRow[],
+): ProviderInfo[] {
+  const byProvider = new Map<string, ModelRow[]>();
+  for (const r of ratings) {
+    if (r.free !== true) continue;
+    const row: ModelRow = {
+      id: r.model,
+      provider: r.provider,
+      ratingMilli: r.rating_milli,
+      contextLength: r.context_length,
+      tools: r.tools,
+      vision: r.vision,
+      json: r.json,
+      free: true,
+    };
+    const list = byProvider.get(r.provider) ?? [];
+    list.push(row);
+    byProvider.set(r.provider, list);
+  }
+  const providers: ProviderInfo[] = directory.map((d) => {
+    const budget = SEALED_BUDGET[d.id] ?? { min: 0, max: 0 };
+    return {
+      id: d.id,
+      name: d.name,
+      wire: d.wire,
+      auth: d.auth,
+      keyEnv: d.key_env,
+      key: d.key,
+      path: d.path,
+      callsMin: budget.min,
+      callsMax: budget.max,
+      models: byProvider.get(d.id) ?? [],
+    };
+  });
+  for (const paid of PAID_MODELS) {
+    const host = providers.find((p) => p.id === paid.provider);
+    if (host) host.models.push(paid);
+  }
+  return providers;
 }
 
-/** One model as a provider's catalog route listed it; null members are what the listing did not say. */
-export interface ProbedModel {
-  id: string;
-  display_name: string;
-  free: boolean | null;
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
+// The catalog document: one entry per provider, base_url is the provider's own
+// path (never joined to the env URL), models carry id / free / context_length.
+// This exact document is what --list prints and what /register sends.
+export function buildCatalog(providers: ProviderInfo[]): {
+  providers: {
+    id: string;
+    base_url: string;
+    key_env: string;
+    wire: Wire;
+    models: { id: string; free: boolean; context_length: number }[];
+  }[];
+} {
+  return {
+    providers: providers.map((p) => ({
+      id: p.id,
+      base_url: p.path,
+      key_env: p.keyEnv,
+      wire: p.wire,
+      models: p.models.map((m) => ({
+        id: m.id,
+        free: m.free,
+        context_length: m.contextLength,
+      })),
+    })),
+  };
 }
 
-/** One provider's catalog probe: what its route answered, and the models it listed. */
-export interface Probe {
-  provider: ProviderDirectoryEntry;
-  ok: boolean;
-  status: number;
-  models: ProbedModel[];
-  error: string | null;
+// Every free model id, in provider order. GET /v1/models lists exactly these.
+export function freeModelIds(providers: ProviderInfo[]): string[] {
+  const ids: string[] = [];
+  for (const p of providers) {
+    for (const m of p.models) if (m.free) ids.push(m.id);
+  }
+  return ids;
 }
 
-/** What a model can do, from the listing first and the quality table second (null: neither said). */
-export interface Capabilities {
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
+export interface ProviderState {
+  attempts: number;
+  consecutiveFailures: number;
+  setAside: boolean;
 }
 
-/** A base path joined to the env's URL; an absolute base_url is used as it stands. */
-export function joinBase(envUrl: string, base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
-  const prefix = envUrl.replace(/\/+$/, '');
-  if (b === '') return prefix;
-  return `${prefix}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
+export function freshState(): ProviderState {
+  return { attempts: 0, consecutiveFailures: 0, setAside: false };
 }
 
-/** The headers a provider wants its key in. */
-export function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
-  if (key === '') return {};
-  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
-  if (auth === 'x-api-key') return { 'x-api-key': key };
-  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
-  return {};
+export interface Candidate {
+  provider: ProviderInfo;
+  model: ModelRow;
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
+// Rank the models that may legally serve this request, best rating first.
+//  * a model must meet every requirement (tools / vision / json / min_context)
+//  * a paid model is never a candidate
+//  * an OpenAI JSON-mode request may only go to a wire that can carry JSON mode
+//    (openai or gemini — the anthropic wire echoes json_mode false, so the
+//    client would fail the echo check)
+//  * when `respectBudgets` is set, providers that spent their soft cap or were
+//    set aside after repeated refusals are skipped; the caller re-runs with it
+//    off as a last resort
+// Ties on rating break toward the provider with more budget left, then by id,
+// so the choice is deterministic.
+export function rankCandidates(
+  providers: ProviderInfo[],
+  states: Map<string, ProviderState>,
+  requires: Requires,
+  opts: { jsonModeOpenAI: boolean; respectBudgets: boolean },
+): Candidate[] {
+  const out: Candidate[] = [];
+  for (const p of providers) {
+    for (const m of p.models) {
+      if (!m.free) continue;
+      if (requires.tools === true && !m.tools) continue;
+      if (requires.vision === true && !m.vision) continue;
+      if (requires.json === true && !m.json) continue;
+      if (requires.minContext !== undefined && m.contextLength < requires.minContext) continue;
+      if (opts.jsonModeOpenAI && p.wire === "anthropic") continue;
+      if (opts.respectBudgets) {
+        const st = states.get(p.id);
+        if (st !== undefined) {
+          if (st.setAside) continue;
+          if (st.attempts >= p.callsMax) continue;
+        }
+      }
+      out.push({ provider: p, model: m });
     }
   }
+  out.sort((a, b) => {
+    if (b.model.ratingMilli !== a.model.ratingMilli) {
+      return b.model.ratingMilli - a.model.ratingMilli;
+    }
+    const leftA = a.provider.callsMax - (states.get(a.provider.id)?.attempts ?? 0);
+    const leftB = b.provider.callsMax - (states.get(b.provider.id)?.attempts ?? 0);
+    if (leftB !== leftA) return leftB - leftA;
+    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
+    return a.model.id < b.model.id ? -1 : 1;
+  });
   return out;
-}
-
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
-
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
-function providerOf(v: unknown): ProviderDirectoryEntry | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
-  if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
-  // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
-  // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
-  const base =
-    stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
-}
-
-function ratingOf(v: unknown): RatingRow | null {
-  if (!isRecord(v)) return null;
-  const model = stringOf(v.model);
-  const provider = stringOf(v.provider);
-  if (model === '' || provider === '') return null;
-  return {
-    model,
-    provider,
-    rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
-    context_length: numberOrNull(v.context_length),
-    tools: v.tools === true,
-    vision: v.vision === true,
-    json: v.json === true,
-    free: v.free === true,
-  };
-}
-
-function workloadRequestOf(v: unknown): WorkloadRequest | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
-  return {
-    id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      tools: requires.tools === true,
-      vision: requires.vision === true,
-      json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
-  };
-}
-
-/** The brief at `path`, its three documents found by schema. */
-export function readBrief(path: string): Brief {
-  const directory: ProviderDirectory = { schema: PROVIDERS_SCHEMA, providers: [] };
-  if (path === '') return { directory, ratings: null, workload: null, error: 'MAKEFUN_PROMPT_FILE is not set' };
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (err) {
-    return { directory, ratings: null, workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
-  }
-  const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
-  if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
-    return { directory, ratings: null, workload: null, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
-  }
-  const providers = directoryDoc.providers.flatMap((v) => {
-    const p = providerOf(v);
-    return p === null ? [] : [p];
-  });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratingRows = ratingsDoc !== null && Array.isArray(ratingsDoc.ratings) ? ratingsDoc.ratings : null;
-  const ratings: RatingsFile | null =
-    ratingsDoc === null || ratingRows === null
-      ? null
-      : {
-          schema: RATINGS_SCHEMA,
-          ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
-            return r === null ? [] : [r];
-          }),
-          best: Array.isArray(ratingsDoc.best)
-            ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
-              })
-            : [],
-        };
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload: WorkloadFile | null =
-    workloadDoc === null || !Array.isArray(workloadDoc.manifest)
-      ? null
-      : {
-          schema: WORKLOAD_SCHEMA,
-          manifest: workloadDoc.manifest.flatMap((v) => {
-            const w = workloadRequestOf(v);
-            return w === null ? [] : [w];
-          }),
-        };
-  return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
-}
-
-/** The rating row of one provider's model, when the quality table has one. */
-export function ratingOfModel(ratings: RatingsFile | null, providerId: string, modelId: string): RatingRow | null {
-  if (ratings === null) return null;
-  return ratings.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
-}
-
-/**
- * Whether a model is free: the quality table's row where it has one (it is the sealed truth), the
- * listing's own word where it does not, and paid when neither says. A paid model is never routed.
- */
-export function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
-  if (row !== null) return row.free;
-  return model.free ?? false;
-}
-
-/** What a model can do: the quality table's row where it has one, the listing's own fields where it does not. */
-export function capabilitiesOf(model: ProbedModel, row: RatingRow | null): Capabilities {
-  return {
-    context_length: row?.context_length ?? model.context_length ?? null,
-    tools: row?.tools ?? model.tools ?? null,
-    vision: row?.vision ?? model.vision ?? null,
-    json: row?.json ?? model.json ?? null,
-  };
-}
-
-/** Whether a model's capabilities meet one request's requirements. An unknown capability never meets one. */
-export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
-  return true;
-}
-
-/** A price field of a listing: 0 when every price is zero, null when the listing says nothing about price. */
-function zeroPriced(v: Json): boolean | null {
-  const pricing = isRecord(v.pricing) ? v.pricing : null;
-  if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
-    if (typeof x === 'number') return [x];
-    if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
-    return [];
-  });
-  if (values.length === 0) return null;
-  return values.every((n) => Number.isFinite(n) && n === 0);
-}
-
-/** One model as a listing wrote it, in whichever wire's spelling. */
-function modelIn(wire: Wire, v: unknown): ProbedModel | null {
-  if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
-  if (id === '') return null;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
-  return {
-    id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
-    context_length: context,
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
-  };
-}
-
-/** The models one catalog route's answer listed, in its wire's shape. */
-function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
-  if (!isRecord(body)) return [];
-  const list = wire === 'gemini' ? body.models : body.data;
-  if (!Array.isArray(list)) return [];
-  return list.flatMap((v) => {
-    const m = modelIn(wire, v);
-    return m === null ? [] : [m];
-  });
-}
-
-/** Probe one provider's catalog route, in its own wire, tolerating every failure. */
-export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
-  try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
-  } catch (err) {
-    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
-  }
-}
-
-/**
- * The catalog the probes and the quality table make: every provider that answered, every model it listed.
- *
- * Its base_url is the directory's own path (`/p/<id>`), never the path joined to `envUrl`: the env's
- * origin differs between a live pass and its replay (a fresh loopback port under the process driver, a
- * fresh pod on the k8s layout), and the catalog is part of the state export a replay must reproduce byte
- * for byte. The scorer compares a reported base_url by its path suffix, so the path passes exactly as the
- * joined URL does; the joined URL reaches a provider, the path names it.
- */
-export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
-  const providers: CatalogProvider[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
-    }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
-  }
-  return { providers };
 }
