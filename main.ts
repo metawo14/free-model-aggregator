@@ -439,17 +439,32 @@ function listen(server: Server): Promise<void> {
   });
 }
 
-/** POST /register with the port and the one catalog; the env answers with the workload's size. */
+/**
+ * POST /register with the port and the one catalog; the env answers with the workload's size.
+ * Retried twice: a trial is lost outright when the first register call meets an env that is
+ * briefly unreachable, and a register that eventually lands changes nothing about the score.
+ */
 async function register(port: number, report: CatalogReport): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const reply: unknown = await res.json();
-  if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the workload holds ${reply.requests} requests`);
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const res = await fetch(`${ENV_URL}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+      const reply: unknown = await res.json();
+      if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the workload holds ${reply.requests} requests`);
+      return;
+    } catch (err) {
+      lastError = err as Error;
+      log(`register attempt ${attempt + 1} failed: ${lastError.message}`);
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  throw lastError ?? new Error('register failed');
 }
 
 /** Poll GET /work every 100 ms; exit 0 the moment it says done. */
